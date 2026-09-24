@@ -4,15 +4,18 @@ X-Policy is a vision-language-action policy for closed-loop, long-horizon robot 
 
 [Checkpoint](https://huggingface.co/ChenShu55/X-Policy-VLA-Arena) · [VLA-Arena](https://github.com/PKU-Alignment/VLA-Arena) · [OpenPI](https://github.com/Physical-Intelligence/openpi)
 
-## What changed
+## Improvements over PI
 
-X-Policy augments the inherited VLA policy with:
+X-Policy keeps PI's pretrained vision-language representation and continuous flow-matching action expert, while extending the policy for closed-loop execution. The main differences are:
 
-- eight recurrent cross-replan memory tokens, split into four fast and four slow slots;
-- ordered subgoal-progress and transition supervision for workflow retention;
-- conditioning on the previous five executed actions;
-- a zero-initialized policy boundary that preserves the parent policy at initialization; and
-- target-preserving PCGrad for the auxiliary training stream.
+- **Context-aware action conditioning.** X-Policy injects pooled visual-language context and robot state into the action expert through adaptive RMS conditioning. A velocity-refinement path further corrects the coarse action trajectory using the current scene and state.
+- **Structured action reasoning.** Implicit visual-language features and an explicit coarse-action trajectory are fused before final denoising, giving the policy an intermediate action plan instead of predicting every action only from a single pooled context.
+- **Contact and object grounding.** The model predicts manipulation phases and contact risk, constructs distinct manipulated/reference object slots, and binds ordered language subgoals to those slots. This targets cautious grasping, spatial relations, distractors, and unseen objects.
+- **Task-routed action experts.** A sparse top-2-of-8 action MoE routes different scene, language, state, and noisy-action contexts to specialized denoising experts, reducing interference between safety, relational, and long-horizon skills.
+- **Persistent closed-loop memory.** Eight recurrent memory tokens—four fast and four slow—carry execution state across replans. Their update observes ordered subgoal progress and the previous five executed actions, allowing the policy to retain workflow state rather than treating each camera observation independently.
+- **Stable successor training.** New policy-facing branches use zero-initialized boundaries, so each extension initially preserves its parent policy. The released memory stage freezes inherited parameters and uses suite-balanced sampling plus target-preserving PCGrad for the auxiliary data stream.
+
+In short, PI supplies the pretrained perception-language-action backbone; X-Policy adds grounded action reasoning, specialized routing, and persistent execution state for safer and more consistent multi-stage behavior.
 
 The released checkpoint is step **18,000**. Its formal VLA-Arena run used five-step replanning, exactly **1,700 episodes**, and produced **924 successes**. The cell-mean success rate is **53.21%** and the episode-weighted success rate is **54.35%**. The complete machine-readable breakdown is in [`results/vla_arena.json`](results/vla_arena.json).
 
