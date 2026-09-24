@@ -1,0 +1,958 @@
+# Copyright 2025 The VLA-Arena Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+JAX training entrypoint for PI0/PI05 with multi-GPU and multi-node support.
+This script mirrors the behavior of the PyTorch trainer (`trainer.py`) but runs
+entirely in JAX using Flax NNX and your existing config/data pipeline.
+
+Usage
+Single GPU:
+  python trainer_jax.py <config_name> --exp_name <run_name> --save_interval <interval>
+  Example:
+  python trainer_jax.py debug --exp_name jax_test
+  python trainer_jax.py debug --exp_name jax_test --resume  # Resume from latest checkpoint
+Multi-GPU/Multi-Node:
+  python trainer_jax.py <config_name> --exp_name <run_name>
+  Example:
+  python trainer_jax.py pi0_aloha_sim --exp_name jax_test
+  python trainer_jax.py pi0_aloha_sim --exp_name jax_test --resume
+
+With YAML config:
+  python trainer_jax.py --config <path_to_config.yaml>
+"""
+
+import dataclasses
+import functools
+import logging
+import os
+import platform
+import sys
+from pathlib import Path
+from typing import Any
+
+# Training is JAX-only.  Loading TensorFlow introduces a second CUDA/NCCL stack
+# and has previously destabilized long-running jobs on this host.
+os.environ.setdefault('USE_TF', '0')
+os.environ.setdefault('TRANSFORMERS_NO_TF', '1')
+
+import etils.epath as epath
+import flax.nnx as nnx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import tqdm_loggable.auto as tqdm
+import wandb
+from flax.training import common_utils
+
+
+# Add openpi src directory to Python path if needed
+_openpi_src = Path(__file__).parent / 'src'
+if str(_openpi_src) not in sys.path:
+    sys.path.insert(0, str(_openpi_src))
+
+import openpi.models.model as _model
+import openpi.shared.array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
+import openpi.training.checkpoints as _checkpoints
+import openpi.training.checkpoint_schedule as _checkpoint_schedule
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
+import openpi.training.optimizer as _optimizer
+import openpi.training.sharding as sharding
+import openpi.training.utils as training_utils
+import openpi.training.weight_loaders as _weight_loaders
+from workflow_utils import ensure_norm_stats
+from workflow_utils import load_train_config_from_yaml
+
+
+def _camera_montage_for_logging(
+    images: dict[str, Any], batch_index: int
+) -> np.ndarray:
+    """Build one horizontal camera montage for frame or sequence batches.
+
+    Ordinary training batches store each camera as ``[B, H, W, C]``.  The
+    recurrent closed-loop stages store them as ``[B, T, H, W, C]``.  Logging
+    is deliberately observational, so for a sequence batch we log the first
+    causal frame instead of passing the extra time axis to ``wandb.Image``.
+    """
+    camera_frames = []
+    for image in images.values():
+        frame = np.asarray(image[batch_index])
+        if frame.ndim == 4:
+            frame = frame[0]
+        if frame.ndim != 3:
+            raise ValueError(
+                'Expected camera data shaped [B,H,W,C] or [B,T,H,W,C], '
+                f'got per-example shape {frame.shape}'
+            )
+        camera_frames.append(frame)
+    if not camera_frames:
+        raise ValueError('Cannot build a camera montage from an empty image mapping')
+    return np.concatenate(camera_frames, axis=1)
+
+
+def init_logging():
+    """Custom logging format for better readability."""
+    level_mapping = {
+        'DEBUG': 'D',
+        'INFO': 'I',
+        'WARNING': 'W',
+        'ERROR': 'E',
+        'CRITICAL': 'C',
+    }
+
+    class CustomFormatter(logging.Formatter):
+        def format(self, record):
+            record.levelname = level_mapping.get(
+                record.levelname, record.levelname
+            )
+            return super().format(record)
+
+    formatter = CustomFormatter(
+        fmt='%(asctime)s.%(msecs)03d [%(levelname)s] %(message)-80s (%(process)d:%(filename)s:%(lineno)s)',
+        datefmt='%H:%M:%S',
+    )
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    else:
+        logger.handlers[0].setFormatter(formatter)
+
+
+def init_wandb(
+    config: _config.TrainConfig, *, resuming: bool, enabled: bool = True
+):
+    """Initialize wandb logging."""
+    if not enabled:
+        wandb.init(mode='disabled')
+        return
+
+    ckpt_dir = config.checkpoint_dir
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(
+            f'Checkpoint directory {ckpt_dir} does not exist.'
+        )
+
+    if resuming:
+        run_id = (ckpt_dir / 'wandb_id.txt').read_text().strip()
+        wandb.init(id=run_id, resume='must', project=config.project_name)
+    else:
+        wandb.init(
+            name=config.exp_name,
+            config=dataclasses.asdict(config),
+            project=config.project_name,
+        )
+        (ckpt_dir / 'wandb_id.txt').write_text(wandb.run.id)
+
+
+def _load_weights_and_validate(
+    loader: _weight_loaders.WeightLoader, params_shape: at.Params
+) -> at.Params:
+    """Loads and validates the weights. Returns a loaded subset of the weights."""
+    loaded_params = loader.load(params_shape)
+    at.check_pytree_equality(
+        expected=params_shape,
+        got=loaded_params,
+        check_shapes=True,
+        check_dtypes=True,
+    )
+
+    # Remove jax.ShapeDtypeStruct from the loaded params
+    import flax.traverse_util as traverse_util
+
+    return traverse_util.unflatten_dict(
+        {
+            k: v
+            for k, v in traverse_util.flatten_dict(loaded_params).items()
+            if not isinstance(v, jax.ShapeDtypeStruct)
+        }
+    )
+
+
+@at.typecheck
+def init_train_state(
+    config: _config.TrainConfig,
+    init_rng: at.KeyArrayLike,
+    mesh: jax.sharding.Mesh,
+    *,
+    resume: bool,
+) -> tuple[training_utils.TrainState, Any]:
+    """Initialize training state."""
+    tx = _optimizer.create_optimizer(
+        config.optimizer,
+        config.lr_schedule,
+        weight_decay_mask=None,
+        update_multipliers=config.optimizer_update_multipliers,
+    )
+
+    def init(
+        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+    ) -> training_utils.TrainState:
+        rng, model_rng = jax.random.split(rng)
+        # initialize the model (and its parameters).
+        model = config.model.create(model_rng)
+
+        # Merge the partial params into the model.
+        if partial_params is not None:
+            graphdef, state = nnx.split(model)
+            # This will produce an error if the partial params are not a subset of the state.
+            state.replace_by_pure_dict(partial_params)
+            model = nnx.merge(graphdef, state)
+
+        params = nnx.state(model)
+        # Convert frozen params to bfloat16.
+        params = nnx_utils.state_map(
+            params,
+            config.freeze_filter,
+            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+        )
+
+        return training_utils.TrainState(
+            step=0,
+            params=params,
+            model_def=nnx.graphdef(model),
+            tx=tx,
+            opt_state=tx.init(params.filter(config.trainable_filter)),
+            ema_decay=config.ema_decay,
+            ema_params=None if config.ema_decay is None else params,
+        )
+
+    train_state_shape = jax.eval_shape(init, init_rng)
+    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
+
+    if resume:
+        return train_state_shape, state_sharding
+
+    partial_params = _load_weights_and_validate(
+        config.weight_loader, train_state_shape.params.to_pure_dict()
+    )
+    replicated_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )
+
+    stable_model_def = train_state_shape.model_def
+
+    def init_with_stable_model_def(rng, partial_params):
+        state = init(rng, partial_params)
+        return state.replace(model_def=stable_model_def)
+
+    # Initialize the train state and mix in the partial params.
+    train_state = jax.jit(
+        init_with_stable_model_def,
+        donate_argnums=(1,),  # donate the partial params buffer.
+        in_shardings=replicated_sharding,
+        out_shardings=state_sharding,
+    )(init_rng, partial_params)
+
+    return train_state, state_sharding
+
+
+@at.typecheck
+def train_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Single training step."""
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+    ):
+        if config.use_persistent_sequence_training:
+            chunked_loss = model.compute_loss_sequence(
+                rng,
+                observation,
+                actions,
+                training_step=state.step,
+                train=True,
+            )
+        else:
+            chunked_loss = model.compute_loss(
+                rng, observation, actions, train=True
+            )
+        return jnp.mean(chunked_loss)
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    # Filter out frozen params.
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, train_rng, observation, actions
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    # Update the model in place and return the new full state.
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(
+        state, step=state.step + 1, params=new_params, opt_state=new_opt_state
+    )
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old
+                + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+
+    # Filter out params that aren't kernels.
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(
+                nnx_utils.PathRegex(
+                    '.*/(bias|scale|pos_embedding|input_embedding)'
+                )
+            ),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        'loss': loss,
+        'grad_norm': optax.global_norm(grads),
+        'param_norm': optax.global_norm(kernel_params),
+    }
+    return new_state, info
+
+
+@at.typecheck
+def batch_gradients(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+):
+    """Compute one batch's gradients without mutating optimizer state."""
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    def loss_fn(model, loss_rng, observation, actions):
+        if config.use_persistent_sequence_training:
+            loss = model.compute_loss_sequence(
+                loss_rng,
+                observation,
+                actions,
+                training_step=state.step,
+                train=True,
+            )
+        else:
+            loss = model.compute_loss(
+                loss_rng, observation, actions, train=True
+            )
+        return jnp.mean(loss)
+
+    observation, actions = batch
+    loss_rng = jax.random.fold_in(rng, state.step)
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    return nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, loss_rng, observation, actions
+    )
+
+
+def mask_gradients_by_path(grads, allowlist: tuple[str, ...]):
+    """Zero auxiliary gradients outside explicitly shared parameter groups."""
+    normalized = tuple(str(pattern) for pattern in allowlist)
+    if not normalized or any(not pattern for pattern in normalized):
+        raise ValueError('gradient path allowlist must be non-empty')
+
+    def mask(path, gradient):
+        if gradient is None:
+            return None
+        rendered = jax.tree_util.keystr(path)
+        if any(pattern in rendered for pattern in normalized):
+            return gradient
+        return jnp.zeros_like(gradient)
+
+    return jax.tree_util.tree_map_with_path(mask, grads)
+
+
+@at.typecheck
+def auxiliary_batch_gradients(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+):
+    if not config.uses_auxiliary_data:
+        raise ValueError('auxiliary data is not configured')
+    # Auxiliary data is an independently normalized single-frame stream.  It
+    # must never inherit the target's recurrent sequence objective.
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    def loss_fn(model, loss_rng, observation, actions):
+        return jnp.mean(
+            model.compute_loss(loss_rng, observation, actions, train=True)
+        )
+
+    observation, actions = batch
+    source_rng = jax.random.fold_in(
+        jax.random.fold_in(rng, state.step), 0xA11CE
+    )
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, source_rng, observation, actions
+    )
+    return loss, mask_gradients_by_path(
+        grads, config.auxiliary_gradient_path_allowlist
+    )
+
+
+def combine_target_and_auxiliary_gradients(
+    target,
+    auxiliary,
+    *,
+    auxiliary_weight: float,
+    gradient_merge: str = 'convex',
+    target_clip_norm: float = 1.0,
+):
+    """Merge target and L1 gradients before the single Adam/EMA update."""
+    if not 0.0 < auxiliary_weight < 1.0:
+        raise ValueError('auxiliary_weight must be in (0, 1)')
+    auxiliary_scale = jnp.asarray(auxiliary_weight, dtype=target[0].dtype)
+    if gradient_merge in (
+        'target_preserving_pcgrad',
+        'clip_aware_target_preserving_pcgrad',
+    ):
+
+        def project(target_gradient, auxiliary_gradient):
+            if target_gradient is None or auxiliary_gradient is None:
+                return auxiliary_gradient
+            target_f32 = target_gradient.astype(jnp.float32)
+            auxiliary_f32 = auxiliary_gradient.astype(jnp.float32)
+            dot = jnp.sum(target_f32 * auxiliary_f32)
+            target_norm_sq = jnp.sum(jnp.square(target_f32))
+            coefficient = jnp.where(
+                dot < 0.0,
+                dot / jnp.maximum(target_norm_sq, 1.0e-12),
+                0.0,
+            )
+            return (
+                auxiliary_f32 - coefficient * target_f32
+            ).astype(auxiliary_gradient.dtype)
+
+        projected = jax.tree.map(project, target[1], auxiliary[1])
+        target_gradients = target[1]
+        if gradient_merge == 'clip_aware_target_preserving_pcgrad':
+            if target_clip_norm <= 0.0:
+                raise ValueError('target_clip_norm must be positive')
+            clip = jnp.asarray(target_clip_norm, dtype=jnp.float32)
+            target_scale = jnp.minimum(
+                1.0,
+                clip / jnp.maximum(optax.global_norm(target_gradients), 1.0e-12),
+            )
+            source_scale = jnp.minimum(
+                1.0,
+                clip / jnp.maximum(optax.global_norm(projected), 1.0e-12),
+            )
+            target_gradients = jax.tree.map(
+                lambda value: value * target_scale, target_gradients
+            )
+            projected = jax.tree.map(
+                lambda value: value * source_scale, projected
+            )
+        return (
+            target[0] + auxiliary_scale * auxiliary[0],
+            jax.tree.map(
+                lambda target_gradient, source_gradient: (
+                    target_gradient + auxiliary_scale * source_gradient
+                ),
+                target_gradients,
+                projected,
+            ),
+        )
+    if gradient_merge != 'convex':
+        raise ValueError(f'unsupported gradient merge: {gradient_merge}')
+    target_scale = jnp.asarray(1.0 - auxiliary_weight, dtype=target[0].dtype)
+    return (
+        target_scale * target[0] + auxiliary_scale * auxiliary[0],
+        jax.tree.map(
+            lambda target_gradient, source_gradient: (
+                target_scale * target_gradient
+                + auxiliary_scale * source_gradient
+            ),
+            target[1],
+            auxiliary[1],
+        ),
+    )
+
+
+@at.typecheck
+def apply_gradients(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    loss,
+    grads,
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Perform exactly one optimizer and EMA update for merged gradients."""
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_trainable = optax.apply_updates(params, updates)
+    nnx.update(model, new_trainable)
+    new_params = nnx.state(model)
+    new_state = dataclasses.replace(
+        state,
+        step=state.step + 1,
+        params=new_params,
+        opt_state=new_opt_state,
+    )
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old
+                + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+    return new_state, {
+        'loss': loss,
+        'grad_norm': optax.global_norm(grads),
+    }
+
+
+def train_loop(config: _config.TrainConfig):
+    """Main training loop."""
+    init_logging()
+    is_main = jax.process_index() == 0
+
+    if is_main:
+        logging.info(
+            f'Running on: {platform.node()} | world_size={jax.process_count()}'
+        )
+        logging.info(
+            f'Training config: batch_size={config.batch_size}, num_train_steps={config.num_train_steps}'
+        )
+        logging.info(f'LR schedule: {type(config.lr_schedule).__name__}')
+        logging.info(f'Optimizer: {type(config.optimizer).__name__}')
+        logging.info(f'EMA decay: {config.ema_decay}')
+
+    if config.batch_size % jax.device_count() != 0:
+        raise ValueError(
+            f'Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}.'
+        )
+    if config.uses_auxiliary_data:
+        if config.auxiliary_batch_size % jax.device_count() != 0:
+            raise ValueError(
+                'Auxiliary batch size must be divisible by the device count.'
+            )
+        logging.info(
+            'Using isolated auxiliary gradients: target=%d source=%d '
+            'weight=%.3f allowlist=%s merge=%s',
+            config.batch_size,
+            config.auxiliary_batch_size,
+            config.auxiliary_loss_weight,
+            config.auxiliary_gradient_path_allowlist,
+            config.auxiliary_gradient_merge,
+        )
+
+    jax.config.update(
+        'jax_compilation_cache_dir',
+        str(epath.Path('~/.cache/jax').expanduser()),
+    )
+
+    rng = jax.random.key(config.seed)
+    train_rng, init_rng = jax.random.split(rng)
+
+    mesh = sharding.make_mesh(config.fsdp_devices)
+    data_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS)
+    )
+    replicated_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )
+
+    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
+        config.checkpoint_dir,
+        keep_period=config.keep_period,
+        overwrite=config.overwrite,
+        resume=config.resume,
+    )
+
+    # Initialize wandb (only on main process)
+    if is_main:
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    data_loader = _data_loader.create_data_loader(
+        config,
+        sharding=data_sharding,
+        shuffle=True,
+    )
+    data_iter = iter(data_loader)
+    batch = next(data_iter)
+    auxiliary_data_iter = None
+    auxiliary_batch = None
+    if config.uses_auxiliary_data:
+        auxiliary_data_loader = _data_loader.create_auxiliary_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=True,
+        )
+        auxiliary_data_iter = iter(auxiliary_data_loader)
+        auxiliary_batch = next(auxiliary_data_iter)
+
+    if is_main:
+        logging.info(
+            f'Initialized data loader:\n{training_utils.array_tree_to_info(batch)}'
+        )
+
+    # Log images from first batch to sanity check.
+    if is_main and config.wandb_enabled and not resuming:
+        images_to_log = [
+            wandb.Image(_camera_montage_for_logging(batch[0].images, i))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({'camera_views': images_to_log}, step=0)
+
+    train_state, train_state_sharding = init_train_state(
+        config, init_rng, mesh, resume=resuming
+    )
+    jax.block_until_ready(train_state)
+
+    if is_main:
+        logging.info(
+            f'Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}'
+        )
+
+    if resuming:
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager, train_state, data_loader
+        )
+        # Rebuild both deterministic sampling streams at the exact number of
+        # batches already consumed by the restored optimizer state.  Merely
+        # restoring parameters/optimizer slots while restarting either
+        # sampler at batch zero changes the training trajectory after a host
+        # failure or the 15k formal-evaluation handoff.
+        completed_batches = int(train_state.step)
+        close_data_iter = getattr(data_iter, 'close', None)
+        if close_data_iter is not None:
+            close_data_iter()
+        data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=True,
+            completed_batches=completed_batches,
+        )
+        data_iter = iter(data_loader)
+        batch = next(data_iter)
+        if config.uses_auxiliary_data:
+            close_auxiliary_iter = getattr(auxiliary_data_iter, 'close', None)
+            if close_auxiliary_iter is not None:
+                close_auxiliary_iter()
+            auxiliary_data_loader = _data_loader.create_auxiliary_data_loader(
+                config,
+                sharding=data_sharding,
+                shuffle=True,
+                completed_batches=completed_batches,
+            )
+            auxiliary_data_iter = iter(auxiliary_data_loader)
+            auxiliary_batch = next(auxiliary_data_iter)
+        if is_main:
+            logging.info(
+                'Resumed target and auxiliary data streams after %d complete batches',
+                completed_batches,
+            )
+
+    if config.uses_auxiliary_data:
+        ptarget_gradients = jax.jit(
+            functools.partial(batch_gradients, config),
+            in_shardings=(
+                replicated_sharding,
+                train_state_sharding,
+                data_sharding,
+            ),
+            out_shardings=(replicated_sharding, replicated_sharding),
+        )
+        pauxiliary_gradients = jax.jit(
+            functools.partial(auxiliary_batch_gradients, config),
+            in_shardings=(
+                replicated_sharding,
+                train_state_sharding,
+                data_sharding,
+            ),
+            out_shardings=(replicated_sharding, replicated_sharding),
+        )
+        pcombine_gradients = jax.jit(
+            functools.partial(
+                combine_target_and_auxiliary_gradients,
+                auxiliary_weight=config.auxiliary_loss_weight,
+                gradient_merge=config.auxiliary_gradient_merge,
+                target_clip_norm=config.auxiliary_target_gradient_clip_norm,
+            )
+        )
+        papply_gradients = jax.jit(
+            functools.partial(apply_gradients, config),
+            in_shardings=(
+                train_state_sharding,
+                replicated_sharding,
+                replicated_sharding,
+            ),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(0, 2),
+        )
+        ptrain_step = None
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(
+                replicated_sharding,
+                train_state_sharding,
+                data_sharding,
+            ),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
+
+    start_step = int(train_state.step)
+    pbar = (
+        tqdm.tqdm(
+            range(start_step, config.num_train_steps),
+            initial=start_step,
+            total=config.num_train_steps,
+            dynamic_ncols=True,
+        )
+        if is_main
+        else None
+    )
+
+    recovery_save_interval = _checkpoint_schedule.recovery_save_interval()
+    if is_main and recovery_save_interval is not None:
+        logging.info(
+            'Enabled recovery-only checkpoints every %d steps; configured '
+            'checkpoints remain every %d steps',
+            recovery_save_interval,
+            config.save_interval,
+        )
+
+    infos = []
+    start_time = None
+    for step in range(start_step, config.num_train_steps):
+        gradient_diagnostics = None
+        if step == start_step:
+            start_time = jax.device_get(
+                jax.block_until_ready(jax.numpy.array(jax.device_count()))
+            )
+            if is_main:
+                import time
+
+                start_time = time.time()
+
+        with sharding.set_mesh(mesh):
+            if config.uses_auxiliary_data:
+                if auxiliary_batch is None or auxiliary_data_iter is None:
+                    raise RuntimeError('auxiliary data iterator is absent')
+                target_gradient = ptarget_gradients(
+                    train_rng, train_state, batch
+                )
+                source_gradient = pauxiliary_gradients(
+                    train_rng, train_state, auxiliary_batch
+                )
+                combined = pcombine_gradients(
+                    target_gradient, source_gradient
+                )
+                train_state, info = papply_gradients(
+                    train_state, combined[0], combined[1]
+                )
+                # Computing these reductions on every update would add
+                # unnecessary dispatches.  A snapshot at the existing log
+                # cadence is sufficient to prove that both independently
+                # differentiated streams remain active.
+                if is_main and step % config.log_interval == 0:
+                    gradient_diagnostics = jax.device_get(
+                        {
+                            'target_grad_norm': optax.global_norm(
+                                target_gradient[1]
+                            ),
+                            'auxiliary_grad_norm': optax.global_norm(
+                                source_gradient[1]
+                            ),
+                        }
+                    )
+                info = {
+                    **info,
+                    'target_loss': target_gradient[0],
+                    'auxiliary_loss': source_gradient[0],
+                }
+                auxiliary_batch = next(auxiliary_data_iter)
+            else:
+                train_state, info = ptrain_step(
+                    train_rng, train_state, batch
+                )
+        infos.append(info)
+
+        # Always materialize metrics for the exact terminal update.  Formal
+        # checkpoint audits must be able to prove that step 29999 executed;
+        # it is intentionally not divisible by common log intervals such as
+        # 20 even though the checkpoint scheduler saves it.
+        if is_main and _checkpoint_schedule.training_log_due(
+            step=step,
+            num_train_steps=config.num_train_steps,
+            log_interval=config.log_interval,
+        ):
+            import time
+
+            elapsed = time.time() - start_time if start_time else 0
+
+            stacked_infos = common_utils.stack_forest(infos)
+            reduced_info = jax.device_get(
+                jax.tree.map(jnp.mean, stacked_infos)
+            )
+            if gradient_diagnostics is not None:
+                reduced_info = {
+                    **reduced_info,
+                    **gradient_diagnostics,
+                }
+            info_str = ', '.join(
+                f'{k}={v:.4f}' for k, v in reduced_info.items()
+            )
+
+            logging.info(f'step={step} {info_str} time={elapsed:.1f}s')
+
+            # Log to wandb
+            if config.wandb_enabled:
+                log_payload = dict(reduced_info)
+                log_payload['step'] = step
+                log_payload['time_per_step'] = (
+                    elapsed / config.log_interval
+                    if config.log_interval > 0
+                    else 0
+                )
+                wandb.log(log_payload, step=step)
+
+            if start_time:
+                start_time = time.time()
+            infos = []
+
+        batch = next(data_iter)
+
+        checkpoint_reason = _checkpoint_schedule.checkpoint_reason(
+            step=step,
+            start_step=start_step,
+            num_train_steps=config.num_train_steps,
+            save_interval=config.save_interval,
+            recovery_interval=recovery_save_interval,
+        )
+        if checkpoint_reason is not None:
+            if is_main:
+                _checkpoints.save_state(
+                    checkpoint_manager, train_state, data_loader, step
+                )
+                logging.info(
+                    'Saved %s checkpoint at step %d',
+                    checkpoint_reason,
+                    step,
+                )
+
+        # Update progress bar
+        if pbar is not None:
+            pbar.update(1)
+            if infos:
+                latest_info = infos[-1]
+                pbar.set_postfix(
+                    {
+                        'loss': f"{latest_info['loss']:.4f}",
+                        'grad_norm': f"{latest_info.get('grad_norm', 0):.2f}",
+                        'step': step,
+                    }
+                )
+
+    # Close progress bar
+    if pbar is not None:
+        pbar.close()
+
+    # Finish wandb run
+    if is_main and config.wandb_enabled:
+        wandb.finish()
+
+    if is_main:
+        logging.info('Waiting for checkpoint manager to finish')
+    checkpoint_manager.wait_until_finished()
+
+
+def main(
+    config: _config.TrainConfig | str | Path | None = None, **override_kwargs
+):
+    """
+    Main entry point for training.
+
+    Args:
+        config: Can be:
+            - None: Use CLI to load config (default behavior)
+            - TrainConfig: Use provided config object
+            - str/Path: Path to config YAML file
+        **override_kwargs: Additional keyword arguments to override config values (e.g., overwrite=True)
+    """
+    init_logging()
+
+    # [Config Parsing] Handle cases where config is a path
+    if isinstance(config, (str, Path)):
+        config_path = Path(config)
+        print(f'Loading configuration from {config_path}...')
+        cfg = load_train_config_from_yaml(config_path, override_kwargs)
+        print(
+            f'Config loaded successfully. Max Steps: {cfg.num_train_steps}, '
+            f'checkpoint_dir: {cfg.checkpoint_dir}'
+        )
+
+    elif isinstance(config, _config.TrainConfig):
+        cfg = config
+    elif config is None:
+        # Default behavior: use CLI
+        cfg = _config.cli()
+    else:
+        raise ValueError(
+            f'Unsupported config type: {type(config)}. Expected TrainConfig, str, Path, or None.'
+        )
+
+    ensure_norm_stats(cfg)
+    train_loop(cfg)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    # Use argparse to parse --config parameter passed by Launcher
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--config', type=str, default=None, help='Path to the config yaml file'
+    )
+    # This allows compatibility with other possible parameters (though currently only config is needed)
+    args, unknown = parser.parse_known_args()
+
+    # Call main with config path string (if provided)
+    main(config=args.config if args.config else None)

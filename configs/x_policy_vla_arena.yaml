@@ -1,0 +1,50 @@
+# Reproduction config for the released X-Policy architecture.
+# Replace the three paths below with local dataset/checkpoint locations.
+name: x_policy_vla_arena
+exp_name: x_policy_vla_arena_reproduction
+
+batch_size: 32
+gradient_accumulation_steps: 1
+auxiliary_batch_size: 32
+auxiliary_loss_weight: 0.35
+num_train_steps: 30000
+log_interval: 20
+save_interval: 15000
+keep_period: 15000
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 0.00001
+  decay_steps: 30000
+  decay_lr: 0.000001
+
+data:
+  repo_id: /path/to/VLA_Arena_L0_L_lerobot_openpi
+  task_progress_supervision: true
+  episode_metadata_path: /path/to/persistent_semantic_phase_targets.json
+
+auxiliary_data:
+  repo_id: /path/to/VLA_Arena_L1_L_lerobot_openpi
+  task_progress_supervision: true
+  episode_metadata_path: /path/to/l1_persistent_semantic_phase_targets.json
+
+weight_loader:
+  params_path: /path/to/parent_checkpoint/params
+
+auxiliary_num_workers: 8
+auxiliary_task_balanced_sampling: true
+auxiliary_gradient_path_allowlist:
+  - persistent_memory
+auxiliary_gradient_merge: target_preserving_pcgrad
+auxiliary_target_gradient_clip_norm: 1.0
+
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+overwrite: false
+resume: false
+wandb_enabled: false
+seed: 7
+num_workers: 16
+task_balanced_sampling: false
+suite_balanced_sampling: true
+fsdp_devices: 1

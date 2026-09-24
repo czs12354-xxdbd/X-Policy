@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+checkpoints/
+wandb/
+policy_records/
+outputs/
+*.log
+
+# Keep datasets and model weights outside Git.
+datasets/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.npz
